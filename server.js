@@ -147,8 +147,8 @@ var minAccuracy = 0.75;
 //       = 1 - max(1, df) / rf
 var freqRatioMax = 1 - minAccuracy;
 
-// Request cache size of size 500_000 (~512MB, 1kB/image).
-var requestCache = new LruCache(500000);
+// Request cache size of 400MB heap limit.
+var requestCache = new LruCache(400000000, 'heap');
 
 // Deep error handling for vendor hooks.
 var vendorDomain = domain.create();
@@ -219,11 +219,13 @@ function cache(f) {
         options = uri;
       }
       return request(options, function(err, res, json) {
-        var cacheControl = res.headers['cache-control'];
-        if (cacheControl != null) {
-          var age = cacheControl.match(/max-age=([0-9]+)/);
-          if ((age != null) && (+age[1] === +age[1])) {
-            cacheInterval = +age[1] * 1000;
+        if (res != null && res.headers != null) {
+          var cacheControl = res.headers['cache-control'];
+          if (cacheControl != null) {
+            var age = cacheControl.match(/max-age=([0-9]+)/);
+            if ((age != null) && (+age[1] === +age[1])) {
+              cacheInterval = +age[1] * 1000;
+            }
           }
         }
         callback(err, res, json);
@@ -270,41 +272,72 @@ cache(function(data, match, sendBadge, request) {
   var userRepo = match[2];  // eg, espadrine/sc
   var branch = match[3];
   var format = match[4];
-  var options = {
-    json: true,
-    uri: 'https://api.travis-ci.org/repos/' + userRepo + '/builds.json'
-  };
-  branch = branch || 'master';
+  var url = 'https://api.travis-ci.org/' + userRepo + '.svg';
+  if (branch != null) {
+    url += '?branch=' + branch;
+  }
   var badgeData = getBadgeData('build', data);
-  request(options, function(err, res, json) {
-    if (err != null || json == null
-      || (json.length !== undefined && json.length === 0)) {
+  fetchFromSvg(request, url, function(err, res) {
+    if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
-    // Find the latest push on this branch.
-    var build = null;
-    for (var i = 0; i < json.length; i++) {
-      if (json[i].state === 'finished' && json[i].event_type === 'push'
-      && json[i].branch === branch) {
-        build = json[i];
-        break;
+    try {
+      badgeData.text[1] = res;
+      if (res === 'passing') {
+        badgeData.colorscheme = 'brightgreen';
+      } else if (res === 'failing') {
+        badgeData.colorscheme = 'red';
+      } else {
+        badgeData.text[1] = 'pending';
       }
+      sendBadge(format, badgeData);
+
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
     }
-    badgeData.text[1] = 'pending';
-    if (build === null) {
+  });
+}));
+
+// Wercker integration
+camp.route(/^\/wercker\/ci\/(.+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var projectId = match[1];  // eg, `54330318b4ce963d50020750`
+  var format = match[2];
+  var options = {
+    method: 'GET',
+    json: true,
+    uri: 'https://app.wercker.com/getbuilds/' + projectId + '?limit=1'
+  };
+  var badgeData = getBadgeData('build', data);
+  request(options, function(err, res, json) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
-    if (build.result === 0) {
-      badgeData.colorscheme = 'brightgreen';
-      badgeData.text[1] = 'passing';
-    } else if (build.result === 1) {
-      badgeData.colorscheme = 'red';
-      badgeData.text[1] = 'failing';
+    try {
+      var build = json[0];
+
+      if (build.status === 'finished') {
+        if (build.result === 'passed') {
+          badgeData.colorscheme = 'brightgreen';
+          badgeData.text[1] = build.result;
+        } else {
+          badgeData.colorscheme = 'red';
+          badgeData.text[1] = build.result;
+        }
+      } else {
+        badgeData.text[1] = build.status;
+      }
+      sendBadge(format, badgeData);
+
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
     }
-    sendBadge(format, badgeData);
   });
 }));
 
@@ -1434,7 +1467,7 @@ cache(function(data, match, sendBadge, request) {
   var type = match[1];
   var spec = match[2];  // eg, AFNetworking
   var format = match[3];
-  var apiUrl = 'http://search.cocoapods.org/api/v1/pod/' + spec + '.json';
+  var apiUrl = 'https://trunk.cocoapods.org/api/v1/pods/' + spec + '/specs/latest';
   var badgeData = getBadgeData('pod', data);
   badgeData.colorscheme = null;
   request(apiUrl, function(err, res, buffer) {
@@ -1480,7 +1513,7 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // GitHub tag integration.
-camp.route(/^\/github\/tag\/(.*)\/(.*)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/github\/tag\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, strongloop/express
   var repo = match[2];
@@ -1526,7 +1559,7 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // GitHub release integration.
-camp.route(/^\/github\/release\/(.*)\/(.*)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/github\/release\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
@@ -1576,7 +1609,7 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // GitHub issues integration.
-camp.route(/^\/github\/issues\/(.*)\/(.*)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/github\/issues\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
@@ -2039,6 +2072,36 @@ cache(function(data, match, sendBadge, request) {
     });
 }));
 
+// Wheelmap integration.
+camp.route(/^\/wheelmap\/a\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var nodeId = match[1];  // eg, `2323004600`.
+  var format = match[2];
+  var options = {
+    method: 'GET',
+    json: true,
+    uri: 'http://wheelmap.org/nodes/' + nodeId + '.json'
+  };
+  var badgeData = getBadgeData('wheelmap', data);
+  request(options, function(err, res, json) {
+    try {
+      var accessibility = json.node.wheelchair;
+      badgeData.text[1] = accessibility;
+      if (accessibility === 'yes') {
+        badgeData.colorscheme = 'brightgreen';
+      } else if (accessibility === 'limited') {
+        badgeData.colorscheme = 'yellow';
+      } else if (accessibility === 'no') {
+        badgeData.colorscheme = 'red';
+      }
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'void';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
 // Any badge.
 camp.route(/^\/(:|badge\/)(([^-]|--)+)-(([^-]|--)+)-(([^-]|--)+)\.(svg|png|gif|jpg)$/,
 function(data, match, end, ask) {
@@ -2222,6 +2285,20 @@ function metric(n) {
   return ''+n;
 }
 
+
+// Get data from a svg-style badge.
+// cb: function(err, string)
+function fetchFromSvg(request, url, cb) {
+  request(url, function(err, res, buffer) {
+    if (err != null) { return cb(err); }
+    try {
+      var match = />([^<>]+)<\/text><\/g>/.exec(buffer);
+      cb(null, match[1]);
+    } catch(e) {
+      cb(e);
+    }
+  });
+}
 
 function coveragePercentageColor(percentage) {
   if (percentage < 80) {
